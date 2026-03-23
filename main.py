@@ -8,7 +8,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from pipeline import process_csv
+from pipeline import run_pipeline as _run_pipeline
+import traceback
+
+def process_csv(csv_text):
+    """Wrapper with error handling."""
+    try:
+        return _run_pipeline(csv_text)
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 app = FastAPI(
     title="FraudShield API",
