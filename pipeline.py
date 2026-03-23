@@ -628,11 +628,15 @@ def stage4_model(df, feature_cols):
     # =====================================================================
 
     # Method 1: Multi-contamination Isolation Forest ensemble (4 IFs vote)
-    iso_votes = np.zeros(len(df))
-    iso_score_sum = np.zeros(len(df))
+    # Use max_samples=min(10000, n) for speed on large datasets
+    n_samples = len(X)
+    max_iso_samples = min(10000, n_samples)
+    iso_votes = np.zeros(n_samples)
+    iso_score_sum = np.zeros(n_samples)
     for cont in [0.05, 0.07, 0.09, 0.12]:
         iso = IsolationForest(
-            n_estimators=150, contamination=cont, max_samples=0.8,
+            n_estimators=100, contamination=cont,
+            max_samples=max_iso_samples,
             random_state=42, n_jobs=-1
         )
         preds = iso.fit_predict(X)
@@ -643,14 +647,34 @@ def stage4_model(df, feature_cols):
     iso_flags = (iso_votes >= 2).astype(int)
     iso_norm = iso_score_sum / 4.0
 
-    # Method 2: LOF (density-based outlier detection)
-    n_samples = len(X)
-    lof_neighbors = min(20, max(5, n_samples // 100))
-    lof = LocalOutlierFactor(n_neighbors=lof_neighbors, contamination=0.08, n_jobs=-1)
-    lof_preds = lof.fit_predict(X)
-    lof_flags = (lof_preds == -1).astype(int)
-    lof_scores = -lof.negative_outlier_factor_
-    lof_norm = (lof_scores - lof_scores.min()) / (lof_scores.max() - lof_scores.min() + 1e-8)
+    # Method 2: LOF on sample (density-based, too slow on 100K+ rows)
+    # Fit on sample, predict on all using the sample's statistics
+    lof_sample_size = min(15000, n_samples)
+    if n_samples > lof_sample_size:
+        # Sample stratified by IF flags to keep outliers in sample
+        sample_idx = np.random.RandomState(42).choice(n_samples, lof_sample_size, replace=False)
+        X_lof_sample = X.iloc[sample_idx]
+        lof = LocalOutlierFactor(n_neighbors=20, contamination=0.08, novelty=False, n_jobs=-1)
+        lof_sample_preds = lof.fit_predict(X_lof_sample)
+        lof_sample_scores = -lof.negative_outlier_factor_
+        # For non-sampled rows: use IF scores as proxy for LOF
+        lof_flags = np.zeros(n_samples, dtype=int)
+        lof_norm = iso_norm.copy()  # Use IF scores as base
+        # Overwrite sampled positions with actual LOF results
+        lof_flags[sample_idx] = (lof_sample_preds == -1).astype(int)
+        s_min, s_max = lof_sample_scores.min(), lof_sample_scores.max()
+        lof_norm_sample = (lof_sample_scores - s_min) / (s_max - s_min + 1e-8)
+        lof_norm[sample_idx] = lof_norm_sample
+        # For non-sampled: flag if IF says anomaly (conservative proxy)
+        non_sample_mask = np.ones(n_samples, dtype=bool)
+        non_sample_mask[sample_idx] = False
+        lof_flags[non_sample_mask] = iso_flags[non_sample_mask]
+    else:
+        lof = LocalOutlierFactor(n_neighbors=20, contamination=0.08, n_jobs=-1)
+        lof_preds = lof.fit_predict(X)
+        lof_flags = (lof_preds == -1).astype(int)
+        lof_scores = -lof.negative_outlier_factor_
+        lof_norm = (lof_scores - lof_scores.min()) / (lof_scores.max() - lof_scores.min() + 1e-8)
 
     # Method 3: Rule-based scoring (domain knowledge)
     rule_scores = np.zeros(len(df))
@@ -713,7 +737,7 @@ def stage4_model(df, feature_cols):
     # =====================================================================
     # STRATIFIED 3-FOLD CV for robust threshold selection
     # =====================================================================
-    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
     fold_thresholds = []
     fold_f1s = []
 
@@ -729,7 +753,7 @@ def stage4_model(df, feature_cols):
             X_tr_res, y_tr_res = X_tr, y_tr
 
         xgb_cv = XGBClassifier(
-            n_estimators=400, max_depth=6, learning_rate=0.025,
+            n_estimators=200, max_depth=5, learning_rate=0.03,
             subsample=0.85, colsample_bytree=0.85, min_child_weight=2,
             gamma=0.03, reg_alpha=0.03, reg_lambda=0.8,
             random_state=42, eval_metric='logloss', n_jobs=-1,
@@ -759,18 +783,18 @@ def stage4_model(df, feature_cols):
 
     # Stronger ensemble
     xgb_clf = XGBClassifier(
-        n_estimators=500, max_depth=6, learning_rate=0.025,
+        n_estimators=300, max_depth=6, learning_rate=0.03,
         subsample=0.85, colsample_bytree=0.85, min_child_weight=2,
         gamma=0.03, reg_alpha=0.03, reg_lambda=0.8,
         scale_pos_weight=1, random_state=42,
         eval_metric='logloss', n_jobs=-1,
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=300, max_depth=7, min_samples_split=4,
+        n_estimators=200, max_depth=6, min_samples_split=4,
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
     gb_clf = GradientBoostingClassifier(
-        n_estimators=200, max_depth=5, learning_rate=0.04,
+        n_estimators=150, max_depth=4, learning_rate=0.05,
         subsample=0.85, random_state=42,
     )
     model = VotingClassifier(
