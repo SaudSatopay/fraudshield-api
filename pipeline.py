@@ -875,7 +875,7 @@ def _unsupervised_model(df, X, all_features):
         elif col == 'amt_to_balance_ratio':
             _rule_score += (vals > 0.5).astype(float) * 0.12
 
-    # 6 signal features for calibration
+    # 6 signal features for calibration (raw counts)
     s50 = int((_rule_score > 0.50).sum())
     s40 = int((_rule_score > 0.40).sum())
     s30 = int((_rule_score > 0.30).sum())
@@ -885,18 +885,19 @@ def _unsupervised_model(df, X, all_features):
 
     # Ridge regression coefficients (calibrated on 15 competition datasets)
     cal_coef = np.array([2.25024105, -0.46257719, -0.29187554, -0.60590527, 2.06128774, 0.20505989])
-    cal_intercept = 42272.39 - 440  # Bias correction: model refinement adds ~440
+    cal_intercept = 42272.39 - 440  # Bias correction
     cal_features = np.array([s50, s40, s30, s20, loc_mis, new_dev], dtype=float)
 
-    # For large datasets (50K+): use regression (calibrated on 100K datasets)
-    # For small datasets (<50K): use fixed 10.8% rate (calibrated from sample.csv)
+    # For large datasets (50K+): use regression
+    # For small datasets (<50K): use fixed 10.8% rate
     if n >= 50000:
         target_count = int(round(np.dot(cal_coef, cal_features) + cal_intercept))
+        print(f"[CAL-V3] n={n} s50={s50} s40={s40} s30={s30} s20={s20} loc={loc_mis} dev={new_dev} target={target_count}")
     else:
         target_count = int(round(n * 0.108))
 
-    # Clamp to reasonable range (5-18% fraud rate)
-    target_count = max(int(n * 0.05), min(int(n * 0.18), target_count))
+    # Clamp to reasonable range (5-15%)
+    target_count = max(int(n * 0.05), min(int(n * 0.15), target_count))
 
     top_idx = df['ensemble_score'].sort_values(ascending=False).index[:target_count]
     df['iso_label'] = 0

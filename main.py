@@ -36,7 +36,7 @@ app.add_middleware(
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "FraudShield API", "engine": "XGBoost + RandomForest + GradientBoosting"}
+    return {"status": "ok", "service": "FraudShield API", "version": "v3-calibrated", "engine": "XGBoost + RandomForest + GradientBoosting"}
 
 
 @app.post("/api/analyze")
