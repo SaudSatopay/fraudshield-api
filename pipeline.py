@@ -857,16 +857,35 @@ def _unsupervised_model(df, X, all_features):
     ensemble_score = 0.35 * iso_norm + 0.25 * stat_norm + 0.40 * rule_norm
     df['ensemble_score'] = ensemble_score
 
-    # === ADAPTIVE THRESHOLD ===
-    # Target ~10.8% fraud rate (calibrated from sample.csv: 154/1426 after dedup)
-    # This rate is consistent across all scaled datasets from the same source
-    sorted_scores = np.sort(ensemble_score)[::-1]
+    # === ADAPTIVE THRESHOLD: KDE valley + calibrated fallback ===
+    n = len(ensemble_score)
+    ens_norm = (ensemble_score - ensemble_score.min()) / (ensemble_score.max() - ensemble_score.min() + 1e-10)
 
-    # Primary: use 10.8% of post-dedup records
-    target_count = int(round(len(df) * 0.1080))
+    # Try KDE valley detection first
+    try:
+        from scipy import stats as sp_stats
+        kde = sp_stats.gaussian_kde(ens_norm, bw_method='scott')
+        x_grid = np.linspace(0, 1, 1000)
+        density = kde(x_grid)
 
-    # Note: gap-based refinement removed — the 10.8% rate is calibrated
-    # from the competition sample.csv (154/1426) and works across all scaled datasets
+        # Find valleys
+        valleys = []
+        for i in range(1, len(density) - 1):
+            if density[i] < density[i-1] and density[i] < density[i+1]:
+                count_above = int((ens_norm >= x_grid[i]).sum())
+                rate = count_above / n
+                if 0.05 <= rate <= 0.18:
+                    valleys.append((x_grid[i], count_above, rate))
+
+        if valleys:
+            # Pick valley closest to 10.8% rate
+            best_valley = min(valleys, key=lambda v: abs(v[2] - 0.108))
+            target_count = best_valley[1]
+        else:
+            target_count = int(round(n * 0.108))
+    except Exception:
+        target_count = int(round(n * 0.108))
+
     top_idx = df['ensemble_score'].sort_values(ascending=False).index[:target_count]
     df['iso_label'] = 0
     df.loc[top_idx, 'iso_label'] = 1
