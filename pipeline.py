@@ -609,8 +609,9 @@ def stage4_model(df, feature_cols):
 
 
 def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
-    """Supervised mode with K-Fold CV, multiple models, hyperparameter tuning."""
+    """Supervised mode with K-Fold CV, multiple models (memory-efficient)."""
     y_gt_full = pd.to_numeric(df['is_fraud'], errors='coerce').fillna(0).astype(int).values
+    is_large = len(df) > 30000
 
     # Update category risk from ground truth
     df_gt = df[valid_labels].copy()
@@ -620,26 +621,45 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
     X = df[all_features].copy().replace([np.inf, -np.inf], np.nan).fillna(0)
     X_gt = X[valid_labels]
 
-    fraud_ratio = y_gt.sum() / len(y_gt)
+    # For large datasets, subsample for CV/training
+    if is_large and len(X_gt) > 30000:
+        fraud_idx = np.where(y_gt == 1)[0]
+        legit_idx = np.where(y_gt == 0)[0]
+        n_legit = min(25000, len(legit_idx))
+        legit_sample = np.random.RandomState(42).choice(legit_idx, n_legit, replace=False)
+        sample_idx = np.concatenate([fraud_idx, legit_sample])
+        np.random.RandomState(42).shuffle(sample_idx)
+        X_gt_train = X_gt.iloc[sample_idx]
+        y_gt_train = y_gt[sample_idx]
+    else:
+        X_gt_train = X_gt
+        y_gt_train = y_gt
+
+    fraud_ratio = y_gt_train.sum() / len(y_gt_train)
     pos_weight = max(1, int((1 - fraud_ratio) / max(fraud_ratio, 0.001)))
 
-    # === K-FOLD CROSS VALIDATION (5-fold) ===
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # === K-FOLD CROSS VALIDATION (5-fold for small, 3-fold for large) ===
+    n_folds = 3 if is_large else 5
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
     cv_results = {'f1': [], 'precision': [], 'recall': [], 'accuracy': [], 'auc': []}
 
+    n_est_xgb = 200 if is_large else 500
+    n_est_rf = 150 if is_large else 300
+    n_est_gb = 100 if is_large else 200
+
     xgb_clf = XGBClassifier(
-        n_estimators=500, max_depth=6, learning_rate=0.02,
+        n_estimators=n_est_xgb, max_depth=6, learning_rate=0.02,
         subsample=0.85, colsample_bytree=0.85, min_child_weight=1,
         gamma=0.05, reg_alpha=0.05, reg_lambda=1.0,
         scale_pos_weight=pos_weight, random_state=42,
         eval_metric='logloss', n_jobs=-1,
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_split=3,
+        n_estimators=n_est_rf, max_depth=8, min_samples_split=3,
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
     gb_clf = GradientBoostingClassifier(
-        n_estimators=200, max_depth=5, learning_rate=0.04,
+        n_estimators=n_est_gb, max_depth=5, learning_rate=0.04,
         subsample=0.85, random_state=42,
     )
     lr_clf = LogisticRegression(
@@ -647,9 +667,9 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
     )
 
     # Run K-Fold CV for metrics reporting
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_gt, y_gt)):
-        X_tr, X_val = X_gt.iloc[train_idx], X_gt.iloc[val_idx]
-        y_tr, y_val = y_gt[train_idx], y_gt[val_idx]
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_gt_train, y_gt_train)):
+        X_tr, X_val = X_gt_train.iloc[train_idx], X_gt_train.iloc[val_idx]
+        y_tr, y_val = y_gt_train[train_idx], y_gt_train[val_idx]
 
         fold_model = VotingClassifier(
             estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
@@ -683,7 +703,7 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
         estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
         voting='soft', weights=[4, 2, 2],
     )
-    model.fit(X_gt, y_gt)
+    model.fit(X_gt_train, y_gt_train)
 
     # Calibrated threshold: match predicted count to actual count
     all_proba = model.predict_proba(X)[:, 1]
@@ -704,7 +724,7 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
 
     # Test set metrics (80/20 for reporting)
     X_train, X_test, y_train, y_test = train_test_split(
-        X_gt, y_gt, test_size=0.2, random_state=42, stratify=y_gt
+        X_gt_train, y_gt_train, test_size=0.2, random_state=42, stratify=y_gt_train
     )
     y_proba_test = model.predict_proba(X_test)[:, 1]
     y_pred_test = (y_proba_test >= calibrated_thresh).astype(int)
@@ -739,23 +759,35 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
 
 
 def _unsupervised_model(df, X, all_features):
-    """Unsupervised mode: Adaptive multi-method ensemble."""
+    """Unsupervised mode: Adaptive multi-method ensemble (memory-efficient for large datasets)."""
     n_samples = len(X)
+    is_large = n_samples > 30000  # Memory-efficient mode for large datasets
+
+    # For large datasets, subsample for IF training but score all rows
+    if is_large:
+        sample_size = min(20000, n_samples)
+        sample_idx = np.random.RandomState(42).choice(n_samples, sample_size, replace=False)
+        X_sample = X.iloc[sample_idx]
+    else:
+        X_sample = X
 
     # === METHOD 1: Multi-contamination Isolation Forest ensemble ===
+    contaminations = [0.08, 0.10, 0.12] if is_large else [0.08, 0.10, 0.12, 0.15, 0.18]
+    n_estimators_if = 100 if is_large else 200
     iso_score_sum = np.zeros(n_samples)
     iso_vote_sum = np.zeros(n_samples)
-    for cont in [0.08, 0.10, 0.12, 0.15, 0.18]:
+    for cont in contaminations:
         iso = IsolationForest(
-            n_estimators=200, contamination=cont,
-            max_samples=min(15000, n_samples),
+            n_estimators=n_estimators_if, contamination=cont,
+            max_samples=min(8000 if is_large else 15000, len(X_sample)),
             random_state=42, n_jobs=-1
         )
-        preds = iso.fit_predict(X)
+        iso.fit(X_sample)
+        preds = iso.predict(X)
         iso_vote_sum += (preds == -1).astype(float)
         scores = -iso.decision_function(X)
         iso_score_sum += (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
-    iso_norm = iso_score_sum / 5.0
+    iso_norm = iso_score_sum / len(contaminations)
 
     # === METHOD 2: Statistical z-score based outlier detection ===
     # For each numerical feature, compute z-score and flag extremes
@@ -864,7 +896,7 @@ def _unsupervised_model(df, X, all_features):
     df['category_risk_score'] = df['merchant_category'].map(cat_fraud_rate).fillna(0)
     X = df[all_features].copy().replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # === SUPERVISED REFINEMENT with sklearn Pipeline ===
+    # === SUPERVISED REFINEMENT (memory-efficient for large datasets) ===
     y_all = df['iso_label'].values
 
     # Label smoothing: remove borderline cases from training
@@ -884,34 +916,52 @@ def _unsupervised_model(df, X, all_features):
     X_clean = X[high_conf_mask]
     y_clean = y_all[high_conf_mask]
 
+    # For large datasets, subsample training data to fit in memory
+    if is_large and len(X_clean) > 25000:
+        # Keep all fraud + subsample legitimate
+        fraud_idx = np.where(y_clean == 1)[0]
+        legit_idx = np.where(y_clean == 0)[0]
+        n_legit_sample = min(20000, len(legit_idx))
+        legit_sample = np.random.RandomState(42).choice(legit_idx, n_legit_sample, replace=False)
+        train_idx = np.concatenate([fraud_idx, legit_sample])
+        X_clean = X_clean.iloc[train_idx]
+        y_clean = y_clean[train_idx]
+
     X_train, X_test, y_train, y_test = train_test_split(
         X_clean, y_clean, test_size=0.2, random_state=42, stratify=y_clean
     )
 
-    # SMOTE for balance
-    try:
-        smote = SMOTE(random_state=42, sampling_strategy=0.85)
-        X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
-    except ValueError:
+    # SMOTE for balance (skip for very large to save memory)
+    if not is_large:
+        try:
+            smote = SMOTE(random_state=42, sampling_strategy=0.85)
+            X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+        except ValueError:
+            X_train_res, y_train_res = X_train, y_train
+    else:
         X_train_res, y_train_res = X_train, y_train
 
-    # Multiple models (as required)
+    # Multiple models — lighter config for large datasets
     fraud_ratio = max(y_train.mean(), 0.01)
     pos_weight = max(1, int((1 - fraud_ratio) / fraud_ratio))
 
+    n_est_xgb = 150 if is_large else 300
+    n_est_rf = 100 if is_large else 200
+    n_est_gb = 80 if is_large else 150
+
     xgb_clf = XGBClassifier(
-        n_estimators=300, max_depth=5, learning_rate=0.03,
+        n_estimators=n_est_xgb, max_depth=5, learning_rate=0.03,
         subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
         gamma=0.05, reg_alpha=0.05, reg_lambda=1.0,
-        scale_pos_weight=1, random_state=42,
+        scale_pos_weight=pos_weight, random_state=42,
         eval_metric='logloss', n_jobs=-1,
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=200, max_depth=6, min_samples_split=5,
+        n_estimators=n_est_rf, max_depth=6, min_samples_split=5,
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
     gb_clf = GradientBoostingClassifier(
-        n_estimators=150, max_depth=4, learning_rate=0.05,
+        n_estimators=n_est_gb, max_depth=4, learning_rate=0.05,
         subsample=0.8, random_state=42,
     )
     lr_clf = LogisticRegression(
