@@ -627,83 +627,42 @@ def stage4_model(df, feature_cols):
     # IMPROVED CONSENSUS LABELING: 4-IF ensemble + LOF + Rules (3 methods)
     # =====================================================================
 
-    # Method 1: Multi-contamination Isolation Forest ensemble (4 IFs vote)
-    # Use max_samples=min(10000, n) for speed on large datasets
+    # Method 1: Single strong Isolation Forest (fast and reliable)
     n_samples = len(X)
-    max_iso_samples = min(10000, n_samples)
-    iso_votes = np.zeros(n_samples)
-    iso_score_sum = np.zeros(n_samples)
-    for cont in [0.05, 0.07, 0.09, 0.12]:
-        iso = IsolationForest(
-            n_estimators=100, contamination=cont,
-            max_samples=max_iso_samples,
-            random_state=42, n_jobs=-1
-        )
-        preds = iso.fit_predict(X)
-        iso_votes += (preds == -1).astype(float)
-        scores = -iso.decision_function(X)
-        iso_score_sum += (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
-    # Flagged if >=2 of 4 IFs agree
-    iso_flags = (iso_votes >= 2).astype(int)
-    iso_norm = iso_score_sum / 4.0
+    iso = IsolationForest(
+        n_estimators=150, contamination=0.07,
+        max_samples=min(10000, n_samples),
+        random_state=42, n_jobs=-1
+    )
+    iso_preds = iso.fit_predict(X)
+    iso_flags = (iso_preds == -1).astype(int)
+    iso_scores = -iso.decision_function(X)
+    iso_norm = (iso_scores - iso_scores.min()) / (iso_scores.max() - iso_scores.min() + 1e-8)
 
-    # Method 2: LOF on sample (density-based, too slow on 100K+ rows)
-    # Fit on sample, predict on all using the sample's statistics
-    lof_sample_size = min(15000, n_samples)
-    if n_samples > lof_sample_size:
-        # Sample stratified by IF flags to keep outliers in sample
-        sample_idx = np.random.RandomState(42).choice(n_samples, lof_sample_size, replace=False)
-        X_lof_sample = X.iloc[sample_idx]
-        lof = LocalOutlierFactor(n_neighbors=20, contamination=0.08, novelty=False, n_jobs=-1)
-        lof_sample_preds = lof.fit_predict(X_lof_sample)
-        lof_sample_scores = -lof.negative_outlier_factor_
-        # For non-sampled rows: use IF scores as proxy for LOF
-        lof_flags = np.zeros(n_samples, dtype=int)
-        lof_norm = iso_norm.copy()  # Use IF scores as base
-        # Overwrite sampled positions with actual LOF results
-        lof_flags[sample_idx] = (lof_sample_preds == -1).astype(int)
-        s_min, s_max = lof_sample_scores.min(), lof_sample_scores.max()
-        lof_norm_sample = (lof_sample_scores - s_min) / (s_max - s_min + 1e-8)
-        lof_norm[sample_idx] = lof_norm_sample
-        # For non-sampled: flag if IF says anomaly (conservative proxy)
-        non_sample_mask = np.ones(n_samples, dtype=bool)
-        non_sample_mask[sample_idx] = False
-        lof_flags[non_sample_mask] = iso_flags[non_sample_mask]
-    else:
-        lof = LocalOutlierFactor(n_neighbors=20, contamination=0.08, n_jobs=-1)
-        lof_preds = lof.fit_predict(X)
-        lof_flags = (lof_preds == -1).astype(int)
-        lof_scores = -lof.negative_outlier_factor_
-        lof_norm = (lof_scores - lof_scores.min()) / (lof_scores.max() - lof_scores.min() + 1e-8)
-
-    # Method 3: Rule-based scoring (domain knowledge)
+    # Method 2: Rule-based scoring (domain knowledge — fine-tuned weights)
     rule_scores = np.zeros(len(df))
-    rule_scores += (df['amount_zscore'].abs() > 2).astype(float) * 0.18
-    rule_scores += (df['amount_zscore'].abs() > 3).astype(float) * 0.07  # extra for extreme
-    rule_scores += (df['txn_velocity_1h'] > 3).astype(float) * 0.16
-    rule_scores += (df['txn_velocity_1h'] > 5).astype(float) * 0.06  # extra for very high
+    rule_scores += (df['amount_zscore'].abs() > 2).astype(float) * 0.20
+    rule_scores += (df['amount_zscore'].abs() > 3).astype(float) * 0.08
+    rule_scores += (df['txn_velocity_1h'] > 3).astype(float) * 0.18
+    rule_scores += (df['txn_velocity_1h'] > 5).astype(float) * 0.07
     rule_scores += (df['location_mismatch'] == 1).astype(float) * 0.12
-    rule_scores += (df['new_device_flag'] == 1).astype(float) * 0.13
-    rule_scores += (df['ip_is_invalid'] == 1).astype(float) * 0.12
+    rule_scores += (df['new_device_flag'] == 1).astype(float) * 0.15
+    rule_scores += (df['ip_is_invalid'] == 1).astype(float) * 0.15
     rule_scores += (df['amt_to_balance_ratio'] > 0.7).astype(float) * 0.10
-    rule_scores += (df['amt_to_balance_ratio'] > 0.9).astype(float) * 0.05  # near-drain
-    rule_scores += df['nighttime'] * 0.04
+    rule_scores += (df['amt_to_balance_ratio'] > 0.9).astype(float) * 0.05
+    rule_scores += df['nighttime'] * 0.05
     rule_scores += (df['cross_user_device'] == 1).astype(float) * 0.05
     rule_scores += (df['time_since_last_txn'] < 60).astype(float) * (df['time_since_last_txn'] > 0).astype(float) * 0.06
     rule_flags = (rule_scores >= 0.35).astype(int)
 
-    # Consensus: flagged if >=2 of 3 methods agree (stricter = cleaner labels)
-    vote_count = iso_flags + lof_flags + rule_flags
+    # Consensus: BOTH methods must agree (high precision), OR very strong single signal
+    vote_count = iso_flags + rule_flags
     consensus_fraud = (vote_count >= 2).astype(int)
+    strong_iso = (iso_norm > np.percentile(iso_norm, 96)).astype(int)
+    strong_rule = (rule_scores >= 0.55).astype(int)
 
-    # Only include very high-confidence single-method detections (stricter)
-    strong_iso = (iso_norm > np.percentile(iso_norm, 98)).astype(int)
-    strong_rule = (rule_scores >= 0.60).astype(int)
-    # Need 2+ strong single-method signals (not just 1)
-    strong_single = ((strong_iso + strong_rule) >= 2).astype(int)
-
-    df['iso_label'] = ((consensus_fraud == 1) | (strong_single == 1)).astype(int)
-    df['ensemble_score'] = 0.40 * iso_norm + 0.20 * lof_norm + 0.40 * rule_scores
+    df['iso_label'] = ((consensus_fraud == 1) | (strong_iso & strong_rule)).astype(int)
+    df['ensemble_score'] = 0.50 * iso_norm + 0.50 * rule_scores
 
     # Update category_risk_score with actual fraud rates
     cat_fraud_rate = df.groupby('merchant_category')['iso_label'].mean().to_dict()
