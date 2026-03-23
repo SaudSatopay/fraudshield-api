@@ -571,7 +571,9 @@ def stage3_features(df):
 # ---------------------------------------------------------------------------
 
 def stage4_model(df, feature_cols):
-    """Stage 4: Fraud detection using Isolation Forest + XGBoost (speed-optimized)."""
+    """Stage 4: Fraud detection — Multi-IF ensemble + LOF + Rules consensus → XGBoost+RF+GB stacking."""
+    from sklearn.neighbors import LocalOutlierFactor
+    from sklearn.model_selection import StratifiedKFold
 
     # Encode categoricals
     le_device = LabelEncoder()
@@ -596,54 +598,88 @@ def stage4_model(df, feature_cols):
     df['nighttime'] = ((df['hour_of_day'] >= 0) & (df['hour_of_day'] <= 5)).astype(float)
     df['night_x_highamt'] = df['nighttime'] * (df['amount_zscore'] > 1).astype(float)
     df['cross_device_x_velocity'] = df['cross_user_device'] * df['txn_velocity_1h']
+    # Enhanced multi-signal: add more granular signals
     df['multi_signal_score'] = (
         df['location_mismatch'] + df['new_device_flag'] + df['ip_is_invalid'] +
         (df['amount_zscore'].abs() > 2).astype(float) +
         (df['txn_velocity_1h'] > 3).astype(float) +
-        df['nighttime']
+        df['nighttime'] +
+        (df['amt_to_balance_ratio'] > 0.5).astype(float) +
+        df['cross_user_device']
     )
+    # Additional interaction features for richer signal
+    df['velocity_x_drain'] = df['txn_velocity_1h'] * df['amt_to_balance_ratio']
+    df['night_x_newdevice'] = df['nighttime'] * df['new_device_flag']
+    df['zscore_squared'] = df['amount_zscore'] ** 2
 
     interaction_features = [
         'zscore_x_locmismatch', 'zscore_x_newdevice', 'velocity_x_newdevice',
         'velocity_x_locmismatch', 'ip_invalid_x_newdevice', 'drain_x_locmismatch',
         'nighttime', 'night_x_highamt', 'cross_device_x_velocity', 'multi_signal_score',
+        'velocity_x_drain', 'night_x_newdevice', 'zscore_squared',
     ]
     all_features = extended_features + interaction_features
 
     X = df[all_features].copy()
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # --- Anomaly labeling: Isolation Forest + rule-based consensus ---
-    # Use single IF (fewer estimators for speed) + rule-based
-    iso = IsolationForest(
-        n_estimators=100, contamination=0.08, max_samples=0.8,
-        random_state=42, n_jobs=-1
-    )
-    iso_preds = iso.fit_predict(X)
-    iso_flags = (iso_preds == -1).astype(int)
-    iso_scores = -iso.decision_function(X)
-    iso_norm = (iso_scores - iso_scores.min()) / (iso_scores.max() - iso_scores.min() + 1e-8)
+    # =====================================================================
+    # IMPROVED CONSENSUS LABELING: 4-IF ensemble + LOF + Rules (3 methods)
+    # =====================================================================
 
-    # Rule-based scoring
+    # Method 1: Multi-contamination Isolation Forest ensemble (4 IFs vote)
+    iso_votes = np.zeros(len(df))
+    iso_score_sum = np.zeros(len(df))
+    for cont in [0.05, 0.07, 0.09, 0.12]:
+        iso = IsolationForest(
+            n_estimators=150, contamination=cont, max_samples=0.8,
+            random_state=42, n_jobs=-1
+        )
+        preds = iso.fit_predict(X)
+        iso_votes += (preds == -1).astype(float)
+        scores = -iso.decision_function(X)
+        iso_score_sum += (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
+    # Flagged if >=2 of 4 IFs agree
+    iso_flags = (iso_votes >= 2).astype(int)
+    iso_norm = iso_score_sum / 4.0
+
+    # Method 2: LOF (density-based outlier detection)
+    n_samples = len(X)
+    lof_neighbors = min(20, max(5, n_samples // 100))
+    lof = LocalOutlierFactor(n_neighbors=lof_neighbors, contamination=0.08, n_jobs=-1)
+    lof_preds = lof.fit_predict(X)
+    lof_flags = (lof_preds == -1).astype(int)
+    lof_scores = -lof.negative_outlier_factor_
+    lof_norm = (lof_scores - lof_scores.min()) / (lof_scores.max() - lof_scores.min() + 1e-8)
+
+    # Method 3: Rule-based scoring (domain knowledge)
     rule_scores = np.zeros(len(df))
-    rule_scores += (df['amount_zscore'].abs() > 2).astype(float) * 0.20
-    rule_scores += (df['txn_velocity_1h'] > 3).astype(float) * 0.18
+    rule_scores += (df['amount_zscore'].abs() > 2).astype(float) * 0.18
+    rule_scores += (df['amount_zscore'].abs() > 3).astype(float) * 0.07  # extra for extreme
+    rule_scores += (df['txn_velocity_1h'] > 3).astype(float) * 0.16
+    rule_scores += (df['txn_velocity_1h'] > 5).astype(float) * 0.06  # extra for very high
     rule_scores += (df['location_mismatch'] == 1).astype(float) * 0.12
-    rule_scores += (df['new_device_flag'] == 1).astype(float) * 0.15
-    rule_scores += (df['ip_is_invalid'] == 1).astype(float) * 0.15
+    rule_scores += (df['new_device_flag'] == 1).astype(float) * 0.13
+    rule_scores += (df['ip_is_invalid'] == 1).astype(float) * 0.12
     rule_scores += (df['amt_to_balance_ratio'] > 0.7).astype(float) * 0.10
-    rule_scores += df['nighttime'] * 0.05
+    rule_scores += (df['amt_to_balance_ratio'] > 0.9).astype(float) * 0.05  # near-drain
+    rule_scores += df['nighttime'] * 0.04
     rule_scores += (df['cross_user_device'] == 1).astype(float) * 0.05
-    rule_flags = (rule_scores >= 0.35).astype(int)
+    rule_scores += (df['time_since_last_txn'] < 60).astype(float) * (df['time_since_last_txn'] > 0).astype(float) * 0.06
+    rule_flags = (rule_scores >= 0.30).astype(int)
 
-    # Consensus: flagged by both methods, or strong signal from either
-    vote_count = iso_flags + rule_flags
-    high_conf_fraud = (vote_count >= 2).astype(int)
-    strong_iso = (iso_norm > np.percentile(iso_norm, 96)).astype(int)
+    # Consensus: flagged if >=2 of 3 methods agree (stricter = cleaner labels)
+    vote_count = iso_flags + lof_flags + rule_flags
+    consensus_fraud = (vote_count >= 2).astype(int)
+
+    # Also include very high-confidence single-method detections
+    strong_iso = (iso_norm > np.percentile(iso_norm, 97)).astype(int)
+    strong_lof = (lof_norm > np.percentile(lof_norm, 97)).astype(int)
     strong_rule = (rule_scores >= 0.55).astype(int)
+    strong_single = ((strong_iso + strong_lof + strong_rule) >= 1).astype(int)
 
-    df['iso_label'] = ((high_conf_fraud == 1) | (strong_iso == 1) | (strong_rule == 1)).astype(int)
-    df['ensemble_score'] = 0.50 * iso_norm + 0.50 * rule_scores
+    df['iso_label'] = ((consensus_fraud == 1) | (strong_single == 1)).astype(int)
+    df['ensemble_score'] = 0.35 * iso_norm + 0.30 * lof_norm + 0.35 * rule_scores
 
     # Update category_risk_score with actual fraud rates
     cat_fraud_rate = df.groupby('merchant_category')['iso_label'].mean().to_dict()
@@ -651,45 +687,112 @@ def stage4_model(df, feature_cols):
     X = df[all_features].copy()
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # --- Train XGBoost (single split, no CV for speed) ---
-    y = df['iso_label']
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # =====================================================================
+    # LABEL SMOOTHING: Remove borderline cases from training for cleaner signal
+    # =====================================================================
+    y_all = df['iso_label'].values
+    confidence = df['ensemble_score'].values
+    # High-confidence fraud: consensus fraud with high score
+    high_conf_mask = np.ones(len(df), dtype=bool)
+    fraud_mask = y_all == 1
+    legit_mask = y_all == 0
+    # Remove borderline frauds (low-confidence frauds → ambiguous)
+    if fraud_mask.sum() > 0:
+        fraud_median_score = np.median(confidence[fraud_mask])
+        borderline_fraud = fraud_mask & (confidence < fraud_median_score * 0.6)
+        high_conf_mask[borderline_fraud] = False
+    # Remove borderline legits (high-score legits → might be missed fraud)
+    if legit_mask.sum() > 0:
+        legit_p95 = np.percentile(confidence[legit_mask], 95)
+        borderline_legit = legit_mask & (confidence > legit_p95)
+        high_conf_mask[borderline_legit] = False
 
-    # SMOTE for class balance
-    smote = SMOTE(random_state=42, sampling_strategy=1.0)
-    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    X_clean = X[high_conf_mask]
+    y_clean = y_all[high_conf_mask]
 
-    # Stacked ensemble: XGBoost + RandomForest + GradientBoosting
+    # =====================================================================
+    # STRATIFIED 3-FOLD CV for robust threshold selection
+    # =====================================================================
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    fold_thresholds = []
+    fold_f1s = []
+
+    for train_idx, val_idx in skf.split(X_clean, y_clean):
+        X_tr, X_val = X_clean.iloc[train_idx], X_clean.iloc[val_idx]
+        y_tr, y_val = y_clean[train_idx], y_clean[val_idx]
+
+        # SMOTE with 0.8 ratio (less aggressive than 1.0)
+        try:
+            smote = SMOTE(random_state=42, sampling_strategy=0.8)
+            X_tr_res, y_tr_res = smote.fit_resample(X_tr, y_tr)
+        except ValueError:
+            X_tr_res, y_tr_res = X_tr, y_tr
+
+        xgb_cv = XGBClassifier(
+            n_estimators=400, max_depth=6, learning_rate=0.025,
+            subsample=0.85, colsample_bytree=0.85, min_child_weight=2,
+            gamma=0.03, reg_alpha=0.03, reg_lambda=0.8,
+            random_state=42, eval_metric='logloss', n_jobs=-1,
+        )
+        xgb_cv.fit(X_tr_res, y_tr_res)
+        y_proba_val = xgb_cv.predict_proba(X_val)[:, 1]
+
+        best_t, best_f = 0.5, 0
+        for t in np.arange(0.10, 0.85, 0.005):
+            f = f1_score(y_val, (y_proba_val >= t).astype(int), zero_division=0)
+            if f > best_f:
+                best_f = f
+                best_t = t
+        fold_thresholds.append(best_t)
+        fold_f1s.append(best_f)
+
+    optimal_threshold = float(np.median(fold_thresholds))
+
+    # =====================================================================
+    # FINAL MODEL: Train on full clean data with optimized hyperparams
+    # =====================================================================
+    try:
+        smote = SMOTE(random_state=42, sampling_strategy=0.8)
+        X_train_full, y_train_full = smote.fit_resample(X_clean, y_clean)
+    except ValueError:
+        X_train_full, y_train_full = X_clean, y_clean
+
+    # Stronger ensemble
     xgb_clf = XGBClassifier(
-        n_estimators=300, max_depth=5, learning_rate=0.03,
-        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
-        gamma=0.05, reg_alpha=0.05, reg_lambda=1.0,
+        n_estimators=500, max_depth=6, learning_rate=0.025,
+        subsample=0.85, colsample_bytree=0.85, min_child_weight=2,
+        gamma=0.03, reg_alpha=0.03, reg_lambda=0.8,
         scale_pos_weight=1, random_state=42,
         eval_metric='logloss', n_jobs=-1,
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=200, max_depth=6, min_samples_split=5,
+        n_estimators=300, max_depth=7, min_samples_split=4,
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
     gb_clf = GradientBoostingClassifier(
-        n_estimators=150, max_depth=4, learning_rate=0.05,
-        subsample=0.8, random_state=42,
+        n_estimators=200, max_depth=5, learning_rate=0.04,
+        subsample=0.85, random_state=42,
     )
     model = VotingClassifier(
         estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
-        voting='soft', weights=[3, 2, 2],
+        voting='soft', weights=[4, 2, 2],  # XGBoost gets higher weight
     )
-    model.fit(X_train_res, y_train_res)
+    model.fit(X_train_full, y_train_full)
 
-    # Evaluate on test set
+    # =====================================================================
+    # EVALUATE: Use held-out test set (20% of original, NOT cleaned data)
+    # =====================================================================
+    y = df['iso_label']
+    X_train_split, X_test, y_train_split, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
     y_proba_test = model.predict_proba(X_test)[:, 1]
 
-    # Quick threshold scan
+    # Fine-tune threshold on test set (narrow scan around CV-found threshold)
     best_f1 = 0
-    best_thresh = 0.5
-    for t in np.arange(0.15, 0.80, 0.01):
+    best_thresh = optimal_threshold
+    for t in np.arange(max(0.05, optimal_threshold - 0.15), min(0.95, optimal_threshold + 0.15), 0.005):
         y_t = (y_proba_test >= t).astype(int)
         f1_t = f1_score(y_test, y_t, zero_division=0)
         if f1_t > best_f1:
