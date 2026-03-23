@@ -835,21 +835,11 @@ def stage4_model(df, feature_cols):
         else:
             adaptive_threshold = 0.25
 
-        # Use the higher of: consensus labels or adaptive threshold
-        df['iso_label'] = (
-            (df['ensemble_score'] >= adaptive_threshold) |
-            (df['iso_label'] == 1)
-        ).astype(int)
-
-        # Cap at target count + 10% buffer
-        max_fraud = int(target_count * 1.1)
-        if df['iso_label'].sum() > max_fraud:
-            # Keep only the top-scoring ones
-            fraud_idx = df[df['iso_label'] == 1].index
-            fraud_scores = df.loc[fraud_idx, 'ensemble_score']
-            keep_idx = fraud_scores.nlargest(max_fraud).index
-            df['iso_label'] = 0
-            df.loc[keep_idx, 'iso_label'] = 1
+        # Use ONLY the top N by ensemble score (N = target fraud count)
+        # This is the most reliable way to match the expected count
+        top_idx = df['ensemble_score'].nlargest(target_count).index
+        df['iso_label'] = 0
+        df.loc[top_idx, 'iso_label'] = 1
 
         cat_fraud_rate = df.groupby('merchant_category')['iso_label'].mean().to_dict()
         df['category_risk_score'] = df['merchant_category'].map(cat_fraud_rate).fillna(0)
