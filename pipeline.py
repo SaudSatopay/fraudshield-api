@@ -677,15 +677,18 @@ def stage4_model(df, feature_cols):
         )
         model.fit(X_train, y_train)
 
-        # Fine threshold scan
+        from sklearn.metrics import fbeta_score
+        # Threshold scan using F2 score (weights recall 2x more than precision)
+        # This catches more fraud at cost of slightly more false positives
         y_proba_test = model.predict_proba(X_test)[:, 1]
-        best_f1 = 0
+        best_score = 0
         best_thresh = 0.5
-        for t in np.arange(0.05, 0.90, 0.005):
+        for t in np.arange(0.02, 0.85, 0.005):
             y_t = (y_proba_test >= t).astype(int)
-            f1_t = f1_score(y_test, y_t, zero_division=0)
-            if f1_t > best_f1:
-                best_f1 = f1_t
+            # Use F2 for threshold selection (recall-weighted)
+            f2_t = fbeta_score(y_test, y_t, beta=2, zero_division=0)
+            if f2_t > best_score:
+                best_score = f2_t
                 best_thresh = t
 
         y_pred = (y_proba_test >= best_thresh).astype(int)
