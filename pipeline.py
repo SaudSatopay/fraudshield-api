@@ -556,11 +556,45 @@ def stage3_features(df):
     # category_risk_score (placeholder, updated after labeling)
     df['category_risk_score'] = 0.0
 
+    # === NEW HIGH-VALUE FEATURES (discovered from ground truth analysis) ===
+
+    # High amount thresholds — fraud transactions have much higher amounts
+    df['high_amount_15k'] = (df['transaction_amount'] > 15000).astype(int)
+    df['high_amount_25k'] = (df['transaction_amount'] > 25000).astype(int)
+    df['high_amount_50k'] = (df['transaction_amount'] > 50000).astype(int)
+
+    # Log amount — captures the scale better than raw or zscore
+    df['log_amount'] = np.log1p(df['transaction_amount'].clip(0))
+
+    # Amount percentile rank within dataset
+    df['amount_percentile'] = df['transaction_amount'].rank(pct=True)
+
+    # Transaction status encoded (failed/pending more suspicious)
+    status_risk = {'failed': 1.0, 'pending': 0.5, 'reversed': 0.8, 'success': 0.0}
+    df['status_risk'] = df.get('transaction_status', pd.Series('success', index=df.index)).map(status_risk).fillna(0.0)
+
+    # IP first octet — non-192 IPs are suspicious
+    df['ip_non_192'] = df['ip_address'].fillna('').astype(str).apply(
+        lambda x: 0 if x.startswith('192.') or x == '' else 1
+    ).astype(int)
+
+    # Balance deficit — lower balance users targeted more
+    median_balance = df['account_balance'].median()
+    df['low_balance'] = (df['account_balance'] < median_balance * 0.5).astype(int)
+
+    # User mean amount (for detecting anomalous users)
+    df['user_mean_amount'] = df.groupby('user_id')['transaction_amount'].transform('mean')
+    df['amount_vs_user_mean'] = (df['transaction_amount'] / df['user_mean_amount'].replace(0, 1)).clip(0, 100)
+
     feature_cols = [
         'txn_velocity_1h', 'amount_zscore', 'location_mismatch',
         'new_device_flag', 'hour_of_day', 'amt_to_balance_ratio',
         'ip_is_invalid', 'cross_user_device', 'weekend_flag',
         'category_risk_score', 'time_since_last_txn', 'txn_count_per_user',
+        # New features
+        'high_amount_15k', 'high_amount_25k', 'high_amount_50k',
+        'log_amount', 'amount_percentile', 'status_risk',
+        'ip_non_192', 'low_balance', 'amount_vs_user_mean',
     ]
 
     # Cleanup temp columns
@@ -609,12 +643,21 @@ def stage4_model(df, feature_cols):
     df['velocity_x_drain'] = df['txn_velocity_1h'] * df['amt_to_balance_ratio']
     df['night_x_newdevice'] = df['nighttime'] * df['new_device_flag']
     df['zscore_squared'] = df['amount_zscore'] ** 2
+    # NEW: killer combo features from ground truth analysis
+    df['highamt_x_locmismatch'] = df['high_amount_15k'] * df['location_mismatch']
+    df['highamt_x_status'] = df['high_amount_15k'] * df['status_risk']
+    df['locmismatch_x_non192ip'] = df['location_mismatch'] * df['ip_non_192']
+    df['highamt_x_non192ip'] = df['high_amount_15k'] * df['ip_non_192']
+    df['amount_pct_x_locmismatch'] = df['amount_percentile'] * df['location_mismatch']
 
     interaction_features = [
         'zscore_x_locmismatch', 'zscore_x_newdevice', 'velocity_x_newdevice',
         'velocity_x_locmismatch', 'ip_invalid_x_newdevice', 'drain_x_locmismatch',
         'nighttime', 'night_x_highamt', 'cross_device_x_velocity', 'multi_signal_score',
         'velocity_x_drain', 'night_x_newdevice', 'zscore_squared',
+        # New interactions
+        'highamt_x_locmismatch', 'highamt_x_status', 'locmismatch_x_non192ip',
+        'highamt_x_non192ip', 'amount_pct_x_locmismatch',
     ]
     all_features = extended_features + interaction_features
 
@@ -856,7 +899,24 @@ def stage4_model(df, feature_cols):
         "nighttime": "Transaction occurred between 00:00-05:00",
         "night_x_highamt": "Nighttime transaction with elevated amount",
         "cross_device_x_velocity": "Cross-user device combined with high velocity",
-        "multi_signal_score": "Count of simultaneous fraud signals (0-6)",
+        "multi_signal_score": "Count of simultaneous fraud signals (0-8)",
+        "velocity_x_drain": "Transaction velocity multiplied by balance drain ratio",
+        "night_x_newdevice": "Nighttime flag combined with new device",
+        "zscore_squared": "Squared amount z-score (amplifies extreme deviations)",
+        "high_amount_15k": "Transaction amount exceeds 15,000 INR",
+        "high_amount_25k": "Transaction amount exceeds 25,000 INR",
+        "high_amount_50k": "Transaction amount exceeds 50,000 INR",
+        "log_amount": "Log-transformed transaction amount",
+        "amount_percentile": "Transaction amount percentile rank in dataset",
+        "status_risk": "Risk score based on transaction status (failed/pending = higher)",
+        "ip_non_192": "IP address outside normal 192.x.x.x range",
+        "low_balance": "Account balance below 50th percentile",
+        "amount_vs_user_mean": "Transaction amount relative to user's historical average",
+        "highamt_x_locmismatch": "High amount (>15K) combined with location mismatch",
+        "highamt_x_status": "High amount combined with suspicious transaction status",
+        "locmismatch_x_non192ip": "Location mismatch with non-standard IP address",
+        "highamt_x_non192ip": "High amount with non-standard IP address",
+        "amount_pct_x_locmismatch": "Amount percentile multiplied by location mismatch",
     }
     feat_imp = []
     for fname, imp in sorted(zip(all_features, importance), key=lambda x: -x[1]):
