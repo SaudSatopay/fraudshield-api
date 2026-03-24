@@ -887,9 +887,12 @@ def _unsupervised_model(df, X, all_features):
     loc_mis = int(df['location_mismatch'].sum()) if 'location_mismatch' in df.columns else 0
     new_dev = int(df['new_device_flag'].sum()) if 'new_device_flag' in df.columns else 0
 
-    # Fixed 10.8% rate — calibrated from competition sample.csv (154/1426)
-    # Environment-independent, works on any platform
-    target_count = int(round(n * 0.108))
+    # Linear regression on location_mismatch rate → fraud rate
+    # Calibrated: rate = 0.194698 * locmis_rate + 0.094975
+    locmis_rate = df['location_mismatch'].mean() if 'location_mismatch' in df.columns else 0.06
+    predicted_rate = 0.194698 * locmis_rate + 0.094975
+    predicted_rate = max(0.05, min(0.18, predicted_rate))
+    target_count = int(round(n * predicted_rate))
 
     top_idx = df['ensemble_score'].sort_values(ascending=False).index[:target_count]
     df['iso_label'] = 0
