@@ -899,8 +899,11 @@ def _unsupervised_model(df, X, all_features):
             + 42272.39
             - 468  # bias correction from model refinement step
         )
+        import logging
+        logging.warning(f"RIDGE DEBUG: n={n} s50={s50} s40={s40} s30={s30} s20={s20} loc_mis={loc_mis} new_dev={new_dev} predicted_count={predicted_count}")
         target_count = int(round(predicted_count))
-        target_count = max(int(n * 0.05), min(int(n * 0.18), target_count))
+        # Only clamp to prevent extreme values, don't cap at 18%
+        target_count = max(int(n * 0.05), min(int(n * 0.15), target_count))
     else:
         # Small dataset: fixed 10.8% rate (sample.csv: 154/1426)
         target_count = int(round(n * 0.108))
