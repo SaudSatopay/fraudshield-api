@@ -11,6 +11,8 @@ import uvicorn
 from pipeline import run_pipeline as _run_pipeline
 import traceback
 
+# Build tag: v4-ridge-468 — forces Railway to restart fresh process
+
 def process_csv(csv_text):
     """Wrapper with error handling."""
     try:
@@ -36,7 +38,7 @@ app.add_middleware(
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "FraudShield API", "version": "v3-calibrated", "engine": "XGBoost + RandomForest + GradientBoosting"}
+    return {"status": "ok", "service": "FraudShield API", "version": "v4-ridge-468", "engine": "XGBoost + RandomForest + GradientBoosting"}
 
 
 @app.post("/api/analyze")
